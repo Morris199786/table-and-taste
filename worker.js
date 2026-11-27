@@ -7,43 +7,50 @@ const mask='places.id,places.displayName,places.formattedAddress,places.location
 
 // Best-effort public metadata only; never bypass login or access restrictions.
 function parseThreadsLink(value,base){
-  let u;try{u=new URL(value,base)}catch{return null}
+  if(typeof value!=='string'||!value.trim())return null;
+  let u;try{u=base?new URL(value,base):new URL(value)}catch{return null}
   if(u.protocol!=='https:'||!['threads.com','www.threads.com','threads.net','www.threads.net'].includes(u.hostname)||u.username||u.password||u.port)return null;
   const post=/^\/@[\w.]+\/post\/[\w-]+\/?$/.test(u.pathname);
-  const share=/^\/share\/[\w-]+\/?$/.test(u.pathname);
+  const share=/^\/(?:share|t)\/[\w-]+\/?$/.test(u.pathname);
   if(!post&&!share)return null;
   u.hash='';return {url:u,post,share};
 }
 async function threadsPreview(value){
   let link=parseThreadsLink(value);
   if(!link)return {error:'請貼上 Threads 分享連結或單篇貼文連結',status:400};
-  const signal=AbortSignal.timeout(12000);
+  const signal=AbortSignal.timeout(15000),visited=new Set(),trace=[];
+  const canonical=()=>link.post?link.url.origin+link.url.pathname:null;
+  const fail=(reason)=>({available:false,canonicalUrl:canonical(),reason,trace});
   try{
-    let r;const visited=new Set();
     for(let i=0;i<6;i++){
-      if(visited.has(link.url.href))return {available:false,reason:'Threads 分享網址轉址循環，請開啟原文後複製貼文網址。'};
+      if(visited.has(link.url.href))return fail('Threads 轉址循環');
       visited.add(link.url.href);
-      r=await fetch(link.url.href,{redirect:'manual',signal,headers:{Accept:'text/html'}});
-      if(![301,302,303,307,308].includes(r.status))break;
-      const next=parseThreadsLink(r.headers.get('Location')||'',link.url.href);
-      if(r.body)await r.body.cancel().catch(()=>{});
-      if(!next)return {available:false,reason:'Threads 分享網址未提供可安全讀取的公開貼文轉址，請開啟原文後複製貼文網址。'};
-      link=next;r=null;
+      const r=await fetch(link.url.href,{redirect:'manual',signal,headers:{Accept:'text/html,application/xhtml+xml','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.8'}});
+      trace.push({status:r.status,path:link.post?'post':'share'});
+      if([301,302,303,307,308].includes(r.status)){
+        const loc=r.headers.get('Location')||'';
+        let target;try{target=new URL(loc,link.url.href)}catch{}
+        const next=parseThreadsLink(loc,link.url.href);
+        if(r.body)await r.body.cancel().catch(()=>{});
+        if(!next){trace.push({redirectHost:target?.hostname||'unknown',redirectPath:target?.pathname?.slice(0,100)||''});return fail('Threads 轉址未指向允許的公開貼文路徑（HTTP '+r.status+'）')}
+        link=next;continue;
+      }
+      if(!r.ok)return fail('Threads 未提供公開頁面（HTTP '+r.status+'）');
+      const meta={};let bytes=0;
+      const rewriter=new HTMLRewriter().on('meta',{element(e){const k=e.getAttribute('property')||e.getAttribute('name');if(['og:title','og:type','og:description','description','twitter:description','og:url'].includes(k)&&!meta[k])meta[k]=(e.getAttribute('content')||'').slice(0,4000)}}).on('link[rel="canonical"]',{element(e){if(!meta.canonical)meta.canonical=e.getAttribute('href')||''}});
+      const reader=rewriter.transform(r).body.getReader();
+      try{while(true){const {done,value}=await reader.read();if(done)break;bytes+=value.byteLength;if(bytes>1500000)break}}finally{await reader.cancel().catch(()=>{})}
+      const next=parseThreadsLink(meta['og:url']||meta.canonical||'',link.url.href);
+      if(next?.post&&!link.post){link=next;if(!meta['og:description']||meta['og:type']!=='article')continue}
+      const description=(meta['og:description']||meta['twitter:description']||'').trim();
+      if(!link.post||!description||/^(threads|log in|sign up|登入|註冊|join threads|say more|share ideas|see what people)/i.test(description))return fail('已讀取公開頁面，但未取得可核對的貼文摘要');
+      return {available:true,text:description,author:link.url.pathname.split('/')[1].slice(1),canonicalUrl:canonical(),source:'public_metadata',trace};
     }
-    if(!r||!r.ok)return {available:false,reason:'Threads 未提供公開摘要'+(r?'（HTTP '+r.status+'）':'')+'，請補充原文文字或截圖。'};
-    const meta={};let bytes=0;
-    const rewriter=new HTMLRewriter().on('meta',{element(e){const k=e.getAttribute('property')||e.getAttribute('name');if(['og:title','og:description','description','og:url'].includes(k)&&!meta[k])meta[k]=(e.getAttribute('content')||'').slice(0,4000)}}).on('link[rel="canonical"]',{element(e){if(!meta.canonical)meta.canonical=e.getAttribute('href')||''}});
-    const reader=rewriter.transform(r).body.getReader();
-    try{while(true){const {done,value}=await reader.read();if(done)break;bytes+=value.byteLength;if(bytes>1000000)break}}finally{await reader.cancel().catch(()=>{})}
-    const canonical=parseThreadsLink(meta['og:url']||meta.canonical||'',link.url.href);
-    if(canonical?.post)link=canonical;
-    const description=(meta['og:description']||meta.description||'').trim();
-    if(!description||/^(threads|log in|sign up|登入|註冊|join threads|say more|share ideas|see what people)/i.test(description)||description.length<12)return {available:false,canonicalUrl:link.post?link.url.origin+link.url.pathname:null,reason:link.post?'已找到貼文，但 Threads 沒有提供可用的公開摘要，請補充文字或截圖。':'分享網址未提供可用的公開貼文摘要，請開啟原文後複製貼文網址，或補充文字／截圖。'};
-    return {available:true,text:description,author:link.post?link.url.pathname.split('/')[1].slice(1):'',canonicalUrl:link.post?link.url.origin+link.url.pathname:null,source:'public_metadata'};
-  }catch{return {available:false,reason:'公開摘要暫時無法取得，請補充文字或截圖。'}}
+    return fail('超過公開轉址次數限制');
+  }catch(e){return fail('公開摘要讀取失敗（'+(e?.name||'Error')+'）')}
 }
 
-export default {async fetch(req,env){const u=new URL(req.url);try{if(!u.pathname.startsWith('/api/'))return env.ASSETS.fetch(req);if(req.method!=='GET'&&req.headers.get('Origin')&&req.headers.get('Origin')!==u.origin)return json({error:'來源不符'},403);if(u.pathname==='/api/status'){await env.DB.prepare('SELECT 1').first();return json({live:!!env.GOOGLE_PLACES_KEY,version:'1.4.3',updated:'2026-11-27'})};if(u.pathname==='/api/search'&&req.method==='POST'){if(!env.GOOGLE_PLACES_KEY)return json({error:'尚未設定 Google API 金鑰'},503);let {center,location,radius,types}=await req.json();radius=Number(radius);if(!Number.isFinite(radius)||radius<.5||radius>30)return json({error:'距離不正確'},400);types=Array.isArray(types)?types.filter(t=>typeof t==='string'&&/^[a-z_]+$/.test(t)).slice(0,10):[];if(!center){if(typeof location!=='string'||!location.trim()||location.length>120)return json({error:'請輸入地區'},400);if(!await reserve(env,'location',900))return json({error:'本月地區查詢額度已達上限'},429);const geo=new URL('https://maps.googleapis.com/maps/api/geocode/json');geo.search=new URLSearchParams({address:location,components:'country:TW',language:'zh-TW',key:env.GOOGLE_PLACES_KEY});const r=await fetch(geo);if(!r.ok)return json({error:'地區定位失敗（Google '+r.status+'）'},502);const data=await r.json();if(data.status==='ZERO_RESULTS')return json({error:'找不到指定地區'},404);if(data.status!=='OK')return json({error:'地區定位失敗（'+data.status+'）'},502);const p=data.results?.[0]?.geometry?.location;if(!p)return json({error:'找不到指定地區'},404);center={lat:p.lat,lng:p.lng}}if(!Number.isFinite(center.lat)||!Number.isFinite(center.lng)||Math.abs(center.lat)>90||Math.abs(center.lng)>180)return json({error:'定位無效'},400);if(!await reserve(env,'search',Math.min(900,Number(env.MONTHLY_SEARCH_LIMIT)||900)))return json({error:'本月搜尋額度已達上限'},429);const r=await google(env,'places:searchNearby',{includedTypes:types.length?types:['restaurant','cafe','bakery','meal_takeaway'],maxResultCount:20,rankPreference:'POPULARITY',languageCode:'zh-TW',regionCode:'TW',locationRestriction:{circle:{center:{latitude:center.lat,longitude:center.lng},radius:radius*1000}}},mask);if(!r.ok)return json({error:'Google 搜尋失敗（'+r.status+'）'},502);const result=await r.json();return json({center,places:(result.places||[]).filter(p=>p.businessStatus!=='CLOSED_PERMANENTLY').map(p=>normalize(p,center))})}
+export default {async fetch(req,env){const u=new URL(req.url);try{if(!u.pathname.startsWith('/api/'))return env.ASSETS.fetch(req);if(req.method!=='GET'&&req.headers.get('Origin')&&req.headers.get('Origin')!==u.origin)return json({error:'來源不符'},403);if(u.pathname==='/api/status'){await env.DB.prepare('SELECT 1').first();return json({live:!!env.GOOGLE_PLACES_KEY,version:'1.4.4',updated:'2026-11-27'})};if(u.pathname==='/api/search'&&req.method==='POST'){if(!env.GOOGLE_PLACES_KEY)return json({error:'尚未設定 Google API 金鑰'},503);let {center,location,radius,types}=await req.json();radius=Number(radius);if(!Number.isFinite(radius)||radius<.5||radius>30)return json({error:'距離不正確'},400);types=Array.isArray(types)?types.filter(t=>typeof t==='string'&&/^[a-z_]+$/.test(t)).slice(0,10):[];if(!center){if(typeof location!=='string'||!location.trim()||location.length>120)return json({error:'請輸入地區'},400);if(!await reserve(env,'location',900))return json({error:'本月地區查詢額度已達上限'},429);const geo=new URL('https://maps.googleapis.com/maps/api/geocode/json');geo.search=new URLSearchParams({address:location,components:'country:TW',language:'zh-TW',key:env.GOOGLE_PLACES_KEY});const r=await fetch(geo);if(!r.ok)return json({error:'地區定位失敗（Google '+r.status+'）'},502);const data=await r.json();if(data.status==='ZERO_RESULTS')return json({error:'找不到指定地區'},404);if(data.status!=='OK')return json({error:'地區定位失敗（'+data.status+'）'},502);const p=data.results?.[0]?.geometry?.location;if(!p)return json({error:'找不到指定地區'},404);center={lat:p.lat,lng:p.lng}}if(!Number.isFinite(center.lat)||!Number.isFinite(center.lng)||Math.abs(center.lat)>90||Math.abs(center.lng)>180)return json({error:'定位無效'},400);if(!await reserve(env,'search',Math.min(900,Number(env.MONTHLY_SEARCH_LIMIT)||900)))return json({error:'本月搜尋額度已達上限'},429);const r=await google(env,'places:searchNearby',{includedTypes:types.length?types:['restaurant','cafe','bakery','meal_takeaway'],maxResultCount:20,rankPreference:'POPULARITY',languageCode:'zh-TW',regionCode:'TW',locationRestriction:{circle:{center:{latitude:center.lat,longitude:center.lng},radius:radius*1000}}},mask);if(!r.ok)return json({error:'Google 搜尋失敗（'+r.status+'）'},502);const result=await r.json();return json({center,places:(result.places||[]).filter(p=>p.businessStatus!=='CLOSED_PERMANENTLY').map(p=>normalize(p,center))})}
 if(u.pathname==='/api/venue'&&req.method==='POST'){if(!env.GOOGLE_PLACES_KEY)return json({error:'尚未設定 Google API 金鑰'},503);const {id,name,lat,lng,center}=await req.json();if(typeof id!=='string'||!/^[-\w]+$/.test(id)||typeof name!=='string'||!name.trim()||name.length>180||!Number.isFinite(lat)||!Number.isFinite(lng)||Math.abs(lat)>90||Math.abs(lng)>180)return json({error:'場所資料不正確'},400);if(!await reserve(env,'search',Math.min(900,Number(env.MONTHLY_SEARCH_LIMIT)||900)))return json({error:'本月搜尋額度已達上限'},429);const r=await google(env,'places:searchText',{textQuery:name+' 館內餐廳 美食',includedType:'restaurant',strictTypeFiltering:true,pageSize:20,languageCode:'zh-TW',regionCode:'TW',locationBias:{circle:{center:{latitude:lat,longitude:lng},radius:500}}},mask+',places.containingPlaces');if(!r.ok)return json({error:'館內搜尋失敗（Google '+r.status+'）'},502);const d=await r.json();const origin=center&&Number.isFinite(center.lat)&&Number.isFinite(center.lng)?center:{lat,lng};const candidates=(d.places||[]).filter(x=>x.id!==id&&x.businessStatus!=='CLOSED_PERMANENTLY').map(x=>normalize(x,origin)).filter(x=>!collection(x));return json({places:candidates.filter(x=>insideVenue(x,id)),unconfirmed:candidates.filter(x=>!insideVenue(x,id)),partial:true})}
 if(u.pathname==='/api/photo'){if(!env.GOOGLE_PLACES_KEY)return json({error:'未設定'},503);const name=u.searchParams.get('name');if(!/^places\/[\w-]+\/photos\/[\w-]+$/.test(name||''))return json({error:'照片識別錯誤'},400);if(!await reserve(env,'photo',900))return json({error:'照片額度已達上限'},429);const r=await fetch('https://places.googleapis.com/v1/'+name+'/media?maxWidthPx=600&skipHttpRedirect=true',{headers:{'X-Goog-Api-Key':env.GOOGLE_PLACES_KEY}});if(!r.ok)return json({error:'照片暫時無法取得'},502);return json({url:(await r.json()).photoUri})}
 const group=req.headers.get('X-Taste-Group')||'';if(!/^[a-f0-9]{32}$/.test(group))return json({error:'缺少收藏空間識別碼'},400);const prefix=group+':';const table={'/api/favorites':'favorites','/api/diary':'diary'}[u.pathname];if(table){if(req.method==='GET'){const r=await env.DB.prepare(`SELECT payload FROM ${table} WHERE id LIKE ? ORDER BY updated_at DESC`).bind(prefix+'%').all();return json(r.results.map(x=>JSON.parse(x.payload)))}if(req.method==='POST'){const p=await req.json();if(typeof p.id!=='string'||p.id.length>250||JSON.stringify(p).length>8000)return json({error:'資料不正確'},400);await env.DB.prepare(`INSERT INTO ${table}(id,payload) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=CURRENT_TIMESTAMP`).bind(prefix+p.id,JSON.stringify(p)).run();return json({ok:true})}if(req.method==='DELETE'){await env.DB.prepare(`DELETE FROM ${table} WHERE id=?`).bind(prefix+(u.searchParams.get('id')||'')).run();return json({ok:true})}}
