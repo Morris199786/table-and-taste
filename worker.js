@@ -6,20 +6,40 @@ async function google(env,path,body,mask){return fetch('https://places.googleapi
 const mask='places.id,places.displayName,places.formattedAddress,places.location,places.types,places.primaryType,places.rating,places.userRatingCount,places.priceLevel,places.priceRange,places.currentOpeningHours,places.googleMapsUri,places.photos,places.businessStatus,places.reviews';
 
 // Best-effort public metadata only; never bypass login or access restrictions.
+function parseThreadsLink(value,base){
+  let u;try{u=new URL(value,base)}catch{return null}
+  if(u.protocol!=='https:'||!['threads.com','www.threads.com','threads.net','www.threads.net'].includes(u.hostname)||u.username||u.password||u.port)return null;
+  const post=/^\/@[\w.]+\/post\/[\w-]+\/?$/.test(u.pathname);
+  const share=/^\/share\/[\w-]+\/?$/.test(u.pathname);
+  if(!post&&!share)return null;
+  u.hash='';return {url:u,post,share};
+}
 async function threadsPreview(value){
-  let u;try{u=new URL(value)}catch{return {error:'連結格式錯誤',status:400}}
-  if(u.protocol!=='https:'||!['threads.com','www.threads.com','threads.net','www.threads.net'].includes(u.hostname)||u.username||u.password||u.port||!/^\/@[\w.]+\/post\/[\w-]+\/?$/.test(u.pathname))return {error:'請貼上 Threads 單篇貼文連結',status:400};
-  u=new URL('https://www.threads.com'+u.pathname);
+  let link=parseThreadsLink(value);
+  if(!link)return {error:'請貼上 Threads 分享連結或單篇貼文連結',status:400};
+  const signal=AbortSignal.timeout(12000);
   try{
-    const r=await fetch(u.href,{redirect:'manual',signal:AbortSignal.timeout(8000),headers:{Accept:'text/html'}});
-    if(!r.ok)return {available:false,reason:'Threads 未提供公開摘要，請補充原文文字或截圖。'};
+    let r;const visited=new Set();
+    for(let i=0;i<6;i++){
+      if(visited.has(link.url.href))return {available:false,reason:'Threads 分享網址轉址循環，請開啟原文後複製貼文網址。'};
+      visited.add(link.url.href);
+      r=await fetch(link.url.href,{redirect:'manual',signal,headers:{Accept:'text/html'}});
+      if(![301,302,303,307,308].includes(r.status))break;
+      const next=parseThreadsLink(r.headers.get('Location')||'',link.url.href);
+      if(r.body)await r.body.cancel().catch(()=>{});
+      if(!next)return {available:false,reason:'Threads 分享網址未提供可安全讀取的公開貼文轉址，請開啟原文後複製貼文網址。'};
+      link=next;r=null;
+    }
+    if(!r||!r.ok)return {available:false,reason:'Threads 未提供公開摘要'+(r?'（HTTP '+r.status+'）':'')+'，請補充原文文字或截圖。'};
     const meta={};let bytes=0;
-    const rewriter=new HTMLRewriter().on('meta',{element(e){const k=e.getAttribute('property')||e.getAttribute('name');if(['og:title','og:description','description'].includes(k)&&!meta[k])meta[k]=(e.getAttribute('content')||'').slice(0,4000)}});
+    const rewriter=new HTMLRewriter().on('meta',{element(e){const k=e.getAttribute('property')||e.getAttribute('name');if(['og:title','og:description','description','og:url'].includes(k)&&!meta[k])meta[k]=(e.getAttribute('content')||'').slice(0,4000)}}).on('link[rel="canonical"]',{element(e){if(!meta.canonical)meta.canonical=e.getAttribute('href')||''}});
     const reader=rewriter.transform(r).body.getReader();
-    try{while(true){const {done,value}=await reader.read();if(done)break;bytes+=value.byteLength;if(bytes>1000000||meta['og:description'])break}}finally{await reader.cancel().catch(()=>{})}
+    try{while(true){const {done,value}=await reader.read();if(done)break;bytes+=value.byteLength;if(bytes>1000000)break}}finally{await reader.cancel().catch(()=>{})}
+    const canonical=parseThreadsLink(meta['og:url']||meta.canonical||'',link.url.href);
+    if(canonical?.post)link=canonical;
     const description=(meta['og:description']||meta.description||'').trim();
-    if(!description||/^(threads|log in|sign up|登入|註冊|join threads|say more|share ideas|see what people)/i.test(description)||description.length<12)return {available:false,reason:'公開網頁沒有可用的文章摘要，請補充文字或截圖。'};
-    return {available:true,text:description,author:u.pathname.split('/')[1].slice(1),source:'public_metadata'};
+    if(!description||/^(threads|log in|sign up|登入|註冊|join threads|say more|share ideas|see what people)/i.test(description)||description.length<12)return {available:false,canonicalUrl:link.post?link.url.origin+link.url.pathname:null,reason:link.post?'已找到貼文，但 Threads 沒有提供可用的公開摘要，請補充文字或截圖。':'分享網址未提供可用的公開貼文摘要，請開啟原文後複製貼文網址，或補充文字／截圖。'};
+    return {available:true,text:description,author:link.post?link.url.pathname.split('/')[1].slice(1):'',canonicalUrl:link.post?link.url.origin+link.url.pathname:null,source:'public_metadata'};
   }catch{return {available:false,reason:'公開摘要暫時無法取得，請補充文字或截圖。'}}
 }
 
