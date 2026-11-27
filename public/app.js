@@ -1,4 +1,4 @@
-import {initSocial, socialMeta, socialRank} from './social.js?v=1.4.0';
+import {initSocial, socialMeta, socialRank} from './social.js?v=1.4.1';
 import {categories,filter,score,km} from './model.js?v=1.3.1';
 import {collection} from './model.js?v=1.3.1';
 import {illustration} from './illustrations.js?v=1.3.0';
